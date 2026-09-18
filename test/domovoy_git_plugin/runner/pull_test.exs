@@ -87,7 +87,7 @@ defmodule DomovoyGitPlugin.Runner.PullTest do
   @spec clone_and_commit(Repository.t()) :: String.t()
   defp clone_and_commit(repository) do
     other = Path.join(repository.parent, "other")
-    Repository.git!(["clone", repository.remote, other])
+    Repository.git!(["clone", "--branch", "main", repository.remote, other])
     Repository.git!(["-C", other, "config", "user.email", "test@example.com"])
     Repository.git!(["-C", other, "config", "user.name", "Domovoy Test"])
     File.write!(Path.join(other, "other.txt"), "other\n")
@@ -100,7 +100,7 @@ defmodule DomovoyGitPlugin.Runner.PullTest do
   @spec clone_and_change_readme(Repository.t()) :: String.t()
   defp clone_and_change_readme(repository) do
     other = Path.join(repository.parent, "other")
-    Repository.git!(["clone", repository.remote, other])
+    Repository.git!(["clone", "--branch", "main", repository.remote, other])
     Repository.git!(["-C", other, "config", "user.email", "test@example.com"])
     Repository.git!(["-C", other, "config", "user.name", "Domovoy Test"])
     File.write!(Path.join(other, "README.md"), "remote\n")

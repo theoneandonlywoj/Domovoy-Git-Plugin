@@ -100,7 +100,7 @@ defmodule DomovoyGitPlugin.Capabilities.RepoStateTest do
       Repository.git!(["-C", repository.root, "commit", "-qm", "local"])
 
       other = Path.join(repository.parent, "other")
-      Repository.git!(["clone", repository.remote, other])
+      Repository.git!(["clone", "--branch", "main", repository.remote, other])
       Repository.git!(["-C", other, "config", "user.email", "test@example.com"])
       Repository.git!(["-C", other, "config", "user.name", "Domovoy Test"])
       File.write!(Path.join(other, "other.txt"), "other\n")
