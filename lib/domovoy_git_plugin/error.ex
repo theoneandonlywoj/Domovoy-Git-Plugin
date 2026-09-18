@@ -37,7 +37,9 @@ defmodule DomovoyGitPlugin.Error do
     :write_worktree_record_failed,
     :git_worktree_diff_failed,
     :linear_branch_name_not_found,
-    :unsupported_git_operation
+    :unsupported_git_operation,
+    :branch_not_found,
+    :remote_branch_not_found
   ]
 
   @typedoc "The `type` of an error that this module builds."
@@ -54,6 +56,8 @@ defmodule DomovoyGitPlugin.Error do
           | :git_worktree_diff_failed
           | :linear_branch_name_not_found
           | :unsupported_git_operation
+          | :branch_not_found
+          | :remote_branch_not_found
 
   @typedoc "The name of the input field that an error concerns."
   @type field_name() :: atom()
@@ -77,7 +81,7 @@ defmodule DomovoyGitPlugin.Error do
       true
 
       iex> length(DomovoyGitPlugin.Error.types())
-      12
+      14
   """
   @spec types() :: [type()]
   def types, do: @types
@@ -443,6 +447,69 @@ defmodule DomovoyGitPlugin.Error do
     DomovoyCore.Error.new(%{
       type: :unsupported_git_operation,
       metadata: %{operation: operation, node_name: node_name, field_name: field_name}
+    })
+  end
+
+  @doc """
+  Builds a `branch_not_found` error for a local branch that does not exist.
+
+  `Runner.Checkout` gives this error instead of creating the branch.
+
+  ## Examples
+
+      iex> DomovoyGitPlugin.Error.branch_not_found("feature", "checkout", :branch_name)
+      %DomovoyCore.Error{
+        type: :branch_not_found,
+        metadata: %{branch: "feature", node_name: "checkout", field_name: :branch_name}
+      }
+  """
+  @spec branch_not_found(
+          branch :: String.t(),
+          node_name :: Node.name(),
+          field_name :: field_name()
+        ) :: DomovoyCore.Error.t()
+  def branch_not_found(branch, node_name, field_name) do
+    DomovoyCore.Error.new(%{
+      type: :branch_not_found,
+      metadata: %{branch: branch, node_name: node_name, field_name: field_name}
+    })
+  end
+
+  @doc """
+  Builds a `remote_branch_not_found` error when a remote-tracking branch does
+  not exist.
+
+  `Runner.TrackRemoteBranch` gives this error when
+  `refs/remotes/<remote>/<branch>` is missing.
+
+  ## Examples
+
+      iex> DomovoyGitPlugin.Error.remote_branch_not_found("origin", "feature", "track", :branch_name)
+      %DomovoyCore.Error{
+        type: :remote_branch_not_found,
+        metadata: %{
+          remote: "origin",
+          branch: "feature",
+          node_name: "track",
+          field_name: :branch_name
+        }
+      }
+  """
+  @spec remote_branch_not_found(
+          remote :: String.t(),
+          branch :: String.t(),
+          node_name :: Node.name(),
+          field_name :: field_name()
+        ) :: DomovoyCore.Error.t()
+  def remote_branch_not_found(remote, branch, node_name, field_name) do
+    DomovoyCore.Error.new(%{
+      type: :remote_branch_not_found,
+      metadata: %{
+        remote: remote,
+        branch: branch,
+        node_name: node_name,
+        field_name: field_name
+      }
     })
   end
 end

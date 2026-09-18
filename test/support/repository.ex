@@ -37,7 +37,7 @@ defmodule DomovoyGitPlugin.Test.Repository do
 
   ## Equivalent Bash
 
-      git init --bare <parent>/origin.git
+      git init --bare --initial-branch=main <parent>/origin.git
       git init --initial-branch=main <parent>/source
       git -C <root> commit -m "Initial commit"
       git -C <root> push -u origin main
@@ -54,7 +54,7 @@ defmodule DomovoyGitPlugin.Test.Repository do
     File.mkdir_p!(root)
     Enum.each(subdirectories, fn directory -> File.mkdir_p!(Path.join(root, directory)) end)
 
-    if remote?, do: git!(["init", "--bare", remote])
+    if remote?, do: git!(["init", "--bare", "--initial-branch=main", remote])
 
     git!(["init", "--initial-branch=main", root])
     git!(["-C", root, "config", "user.email", "test@example.com"])

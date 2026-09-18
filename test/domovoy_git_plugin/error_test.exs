@@ -15,7 +15,7 @@ defmodule DomovoyGitPlugin.ErrorTest do
   describe "types/0" do
     test "names each type exactly once" do
       assert GitError.types() == Enum.uniq(GitError.types())
-      assert length(GitError.types()) == 12
+      assert length(GitError.types()) == 14
     end
 
     test "names every type the builders give, and no other" do
@@ -130,7 +130,9 @@ defmodule DomovoyGitPlugin.ErrorTest do
       GitError.write_worktree_record_failed(:eacces, "bro-19", @node_name, @field_name),
       GitError.worktree_diff_failed("no base branch", @node_name, @field_name),
       GitError.branch_name_not_found(@node_name, @field_name),
-      GitError.unsupported_operation("rebase", @node_name, @field_name)
+      GitError.unsupported_operation("rebase", @node_name, @field_name),
+      GitError.branch_not_found("feature", @node_name, @field_name),
+      GitError.remote_branch_not_found("origin", "feature", @node_name, @field_name)
     ]
   end
 end
