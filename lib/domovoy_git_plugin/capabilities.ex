@@ -20,17 +20,21 @@ defmodule DomovoyGitPlugin.Capabilities do
 
   The functions that parse text and read records are in
   `DomovoyGitPlugin.Capabilities.WorktreeMetadata`,
-  `DomovoyGitPlugin.Capabilities.DiffParser` and
-  `DomovoyGitPlugin.Capabilities.DiffMarkdown`.
+  `DomovoyGitPlugin.Capabilities.DiffParser`,
+  `DomovoyGitPlugin.Capabilities.DiffMarkdown` and
+  `DomovoyGitPlugin.Capabilities.Conflict`.
   """
 
   alias DomovoyCore.Error
   alias DomovoyCore.Node
   alias DomovoyCore.Shell
+  alias DomovoyGitPlugin.Capabilities.Conflict
   alias DomovoyGitPlugin.Capabilities.DiffParser
   alias DomovoyGitPlugin.Capabilities.StatusEntry
   alias DomovoyGitPlugin.Capabilities.WorktreeMetadata
   alias DomovoyGitPlugin.Error, as: GitError
+  alias DomovoyGitPlugin.Type.Conflicts, as: ConflictsType
+  alias DomovoyGitPlugin.Type.RepoState, as: RepoStateType
   alias DomovoyGitPlugin.Type.StatusEntries, as: StatusEntriesType
   alias DomovoyGitPlugin.Type.Worktree, as: WorktreeType
   alias DomovoyGitPlugin.Type.WorktreeDiff, as: WorktreeDiffType
@@ -45,6 +49,16 @@ defmodule DomovoyGitPlugin.Capabilities do
   @type branch_location() :: :local | :remote | :new
 
   @git_timeout 30_000
+  @fetch_timeout 120_000
+  @editor_env [{"GIT_EDITOR", "true"}, {"VISUAL", "true"}, {"EDITOR", "true"}]
+
+  @operation_probes [
+    {"rebase-merge", :rebasing},
+    {"rebase-apply", :rebasing},
+    {"MERGE_HEAD", :merging},
+    {"CHERRY_PICK_HEAD", :cherry_picking},
+    {"REVERT_HEAD", :reverting}
+  ]
 
   @doc """
   Resolves `working_directory` to its Git repository root.
@@ -209,31 +223,90 @@ defmodule DomovoyGitPlugin.Capabilities do
   end
 
   @doc """
-  Checks out the branch `branch` in the worktree at `worktree_path`.
+  Checks out a local branch. Does not create the branch if it is missing.
 
-  If the branch is on the disk, this function checks it out. If the branch is
-  only on `origin`, this function makes a local branch that tracks the remote
-  branch. If the branch is nowhere, this function makes the branch.
+  A missing `refs/heads/<branch>` gives a `branch_not_found` error. A dirty
+  working tree fails as Git fails, with `git_command_failed`. There is no
+  `--force`.
 
   ## Equivalent Bash
 
-      git -C /repo/.worktrees/feature checkout feature
-      git -C /repo/.worktrees/feature checkout --track origin/feature
-      git -C /repo/.worktrees/feature checkout -b feature
+      git -C /repo checkout feature
   """
-  @spec checkout_branch(
+  @spec checkout(
           branch :: String.t(),
-          worktree_path :: String.t(),
           working_directory :: String.t(),
           node_name :: Node.name(),
           field_name :: GitError.field_name()
         ) :: :ok | failure()
-  def checkout_branch(branch, worktree_path, working_directory, node_name, field_name)
-      when is_binary(branch) and is_binary(worktree_path) and is_binary(working_directory) do
-    with {:ok, location} <- branch_location(branch, worktree_path, node_name, field_name),
+  def checkout(branch, working_directory, node_name, field_name)
+      when is_binary(branch) and is_binary(working_directory) do
+    with {:ok, exists?} <-
+           branch_exists?("refs/heads/#{branch}", working_directory, node_name, field_name),
+         :ok <- require_local_branch(exists?, branch, node_name, field_name),
          {:ok, _output} <-
-           worktree_path
-           |> checkout_args(branch, location)
+           run_command(["checkout", branch], working_directory, node_name, field_name) do
+      :ok
+    end
+  end
+
+  @doc """
+  Checks out a remote-tracking branch as a new local branch.
+
+  A missing `refs/remotes/<remote>/<branch>` gives a `remote_branch_not_found`
+  error. `remote` is typically `"origin"`.
+
+  ## Equivalent Bash
+
+      git -C /repo checkout --track origin/feature
+  """
+  @spec track_remote_branch(
+          branch :: String.t(),
+          remote :: String.t(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def track_remote_branch(branch, remote, working_directory, node_name, field_name)
+      when is_binary(branch) and is_binary(remote) and is_binary(working_directory) do
+    ref = "refs/remotes/#{remote}/#{branch}"
+
+    with {:ok, exists?} <- branch_exists?(ref, working_directory, node_name, field_name),
+         :ok <- require_remote_branch(exists?, remote, branch, node_name, field_name),
+         {:ok, _output} <-
+           run_command(
+             ["checkout", "--track", "#{remote}/#{branch}"],
+             working_directory,
+             node_name,
+             field_name
+           ) do
+      :ok
+    end
+  end
+
+  @doc """
+  Creates `branch` and checks it out.
+
+  `start_point` is optional. When it is `nil` or empty, Git uses `HEAD`. An
+  existing branch name fails as Git fails.
+
+  ## Equivalent Bash
+
+      git -C /repo checkout -b feature
+      git -C /repo checkout -b feature main
+  """
+  @spec create_branch(
+          branch :: String.t(),
+          start_point :: String.t() | nil,
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def create_branch(branch, start_point, working_directory, node_name, field_name)
+      when is_binary(branch) and is_binary(working_directory) do
+    with {:ok, _output} <-
+           branch
+           |> create_branch_args(start_point)
            |> run_command(working_directory, node_name, field_name) do
       :ok
     end
@@ -241,6 +314,9 @@ defmodule DomovoyGitPlugin.Capabilities do
 
   @doc """
   Fetches the remote `remote` into the repository at `working_directory`.
+
+  The default timeout is 120 seconds. Pass `timeout:` in `opts` to override it.
+  There is no prune and no tags flag.
 
   ## Equivalent Bash
 
@@ -250,11 +326,401 @@ defmodule DomovoyGitPlugin.Capabilities do
           remote :: String.t(),
           working_directory :: String.t(),
           node_name :: Node.name(),
-          field_name :: GitError.field_name()
+          field_name :: GitError.field_name(),
+          opts :: keyword()
         ) :: command_output_result()
-  def fetch(remote, working_directory, node_name, field_name)
+  def fetch(remote, working_directory, node_name, field_name, opts \\ [])
       when is_binary(remote) and is_binary(working_directory) do
-    run_command(["fetch", remote], working_directory, node_name, field_name)
+    opts = Keyword.put_new(opts, :timeout, @fetch_timeout)
+    run_command(["fetch", remote], working_directory, node_name, field_name, opts)
+  end
+
+  @doc """
+  Stages the given paths with `git add --`.
+
+  An empty path list is invalid. It does not become `git add .`. There is no
+  `-f`.
+
+  ## Equivalent Bash
+
+      git -C /repo add -- README.md lib/a.ex
+  """
+  @spec add(
+          paths :: [String.t()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def add(paths, working_directory, node_name, field_name)
+      when is_list(paths) and is_binary(working_directory) do
+    with :ok <- require_paths(paths, node_name, field_name),
+         {:ok, _output} <-
+           run_command(["add", "--" | paths], working_directory, node_name, field_name) do
+      :ok
+    end
+  end
+
+  @doc """
+  Stages every change in the working tree with `git add -A`.
+
+  ## Equivalent Bash
+
+      git -C /repo add -A
+  """
+  @spec add_all(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def add_all(working_directory, node_name, field_name) when is_binary(working_directory) do
+    with {:ok, _output} <- run_command(["add", "-A"], working_directory, node_name, field_name) do
+      :ok
+    end
+  end
+
+  @doc """
+  Creates a commit with `message`.
+
+  Identity is the repository `user.name` and `user.email`. A missing identity
+  fails as Git fails. There is no `--amend`, no `--no-verify`, and no signing
+  flag.
+
+  ## Equivalent Bash
+
+      git -C /repo commit -m "Add the snapshot"
+      git -C /repo commit --allow-empty -m "Empty"
+  """
+  @spec commit(
+          message :: String.t(),
+          allow_empty? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def commit(message, allow_empty?, working_directory, node_name, field_name)
+      when is_binary(message) and is_boolean(allow_empty?) and is_binary(working_directory) do
+    with {:ok, _output} <-
+           message
+           |> commit_args(allow_empty?)
+           |> run_command(working_directory, node_name, field_name) do
+      :ok
+    end
+  end
+
+  @doc """
+  Merges `ref` into the current branch.
+
+  When `fail_on_conflict?` is true, a conflicted stop is `git_command_failed`.
+  When it is false, Git exit 1 with `operation: :merging` is success.
+
+  ## Equivalent Bash
+
+      git -C /repo merge --no-edit feature
+  """
+  @spec merge(
+          ref :: String.t(),
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def merge(ref, fail_on_conflict?, working_directory, node_name, field_name)
+      when is_binary(ref) and is_boolean(fail_on_conflict?) and is_binary(working_directory) do
+    integrate(
+      ["merge", "--no-edit", ref],
+      fail_on_conflict?,
+      [:merging],
+      working_directory,
+      node_name,
+      field_name
+    )
+  end
+
+  @doc """
+  Rebases the current branch onto `ref`.
+
+  The rebase is not interactive. When `fail_on_conflict?` is false, Git exit 1
+  with `operation: :rebasing` is success.
+
+  ## Equivalent Bash
+
+      git -C /repo rebase main
+  """
+  @spec rebase(
+          ref :: String.t(),
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def rebase(ref, fail_on_conflict?, working_directory, node_name, field_name)
+      when is_binary(ref) and is_boolean(fail_on_conflict?) and is_binary(working_directory) do
+    integrate(
+      ["rebase", ref],
+      fail_on_conflict?,
+      [:rebasing],
+      working_directory,
+      node_name,
+      field_name
+    )
+  end
+
+  @doc """
+  Cherry-picks `ref` onto the current branch.
+
+  When `fail_on_conflict?` is false, Git exit 1 with `operation: :cherry_picking`
+  is success.
+
+  ## Equivalent Bash
+
+      git -C /repo cherry-pick abc123
+  """
+  @spec cherry_pick(
+          ref :: String.t(),
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def cherry_pick(ref, fail_on_conflict?, working_directory, node_name, field_name)
+      when is_binary(ref) and is_boolean(fail_on_conflict?) and is_binary(working_directory) do
+    integrate(
+      ["cherry-pick", ref],
+      fail_on_conflict?,
+      [:cherry_picking],
+      working_directory,
+      node_name,
+      field_name
+    )
+  end
+
+  @doc """
+  Aborts an in-progress merge.
+
+  ## Equivalent Bash
+
+      git -C /repo merge --abort
+  """
+  @spec merge_abort(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def merge_abort(working_directory, node_name, field_name) when is_binary(working_directory) do
+    finish_command(["merge", "--abort"], working_directory, node_name, field_name)
+  end
+
+  @doc """
+  Aborts an in-progress rebase.
+
+  ## Equivalent Bash
+
+      git -C /repo rebase --abort
+  """
+  @spec rebase_abort(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def rebase_abort(working_directory, node_name, field_name) when is_binary(working_directory) do
+    finish_command(["rebase", "--abort"], working_directory, node_name, field_name)
+  end
+
+  @doc """
+  Aborts an in-progress cherry-pick.
+
+  ## Equivalent Bash
+
+      git -C /repo cherry-pick --abort
+  """
+  @spec cherry_pick_abort(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def cherry_pick_abort(working_directory, node_name, field_name)
+      when is_binary(working_directory) do
+    finish_command(["cherry-pick", "--abort"], working_directory, node_name, field_name)
+  end
+
+  @doc """
+  Continues an in-progress merge.
+
+  Git uses the existing `MERGE_MSG`. There is no message input. Remaining
+  conflicts fail, unless `fail_on_conflict?` is false and the checkout is still
+  merging.
+
+  ## Equivalent Bash
+
+      git -C /repo -c core.editor=true merge --continue
+  """
+  @spec merge_continue(
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def merge_continue(fail_on_conflict?, working_directory, node_name, field_name)
+      when is_boolean(fail_on_conflict?) and is_binary(working_directory) do
+    integrate(
+      ["-c", "core.editor=true", "merge", "--continue"],
+      fail_on_conflict?,
+      [:merging],
+      working_directory,
+      node_name,
+      field_name,
+      env: @editor_env
+    )
+  end
+
+  @doc """
+  Continues an in-progress rebase.
+
+  ## Equivalent Bash
+
+      git -C /repo -c core.editor=true rebase --continue
+  """
+  @spec rebase_continue(
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def rebase_continue(fail_on_conflict?, working_directory, node_name, field_name)
+      when is_boolean(fail_on_conflict?) and is_binary(working_directory) do
+    integrate(
+      ["-c", "core.editor=true", "rebase", "--continue"],
+      fail_on_conflict?,
+      [:rebasing],
+      working_directory,
+      node_name,
+      field_name,
+      env: @editor_env
+    )
+  end
+
+  @doc """
+  Continues an in-progress cherry-pick.
+
+  ## Equivalent Bash
+
+      git -C /repo -c core.editor=true cherry-pick --continue
+  """
+  @spec cherry_pick_continue(
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def cherry_pick_continue(fail_on_conflict?, working_directory, node_name, field_name)
+      when is_boolean(fail_on_conflict?) and is_binary(working_directory) do
+    integrate(
+      ["-c", "core.editor=true", "cherry-pick", "--continue"],
+      fail_on_conflict?,
+      [:cherry_picking],
+      working_directory,
+      node_name,
+      field_name,
+      env: @editor_env
+    )
+  end
+
+  @doc """
+  Checks out the `--ours` stage of the given paths. Does not `git add`.
+
+  ## Equivalent Bash
+
+      git -C /repo checkout --ours -- README.md
+  """
+  @spec checkout_ours(
+          paths :: [String.t()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def checkout_ours(paths, working_directory, node_name, field_name)
+      when is_list(paths) and is_binary(working_directory) do
+    checkout_stage("--ours", paths, working_directory, node_name, field_name)
+  end
+
+  @doc """
+  Checks out the `--theirs` stage of the given paths. Does not `git add`.
+
+  ## Equivalent Bash
+
+      git -C /repo checkout --theirs -- README.md
+  """
+  @spec checkout_theirs(
+          paths :: [String.t()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def checkout_theirs(paths, working_directory, node_name, field_name)
+      when is_list(paths) and is_binary(working_directory) do
+    checkout_stage("--theirs", paths, working_directory, node_name, field_name)
+  end
+
+  @doc """
+  Fetches `remote` and then merges or rebases the fetched ref.
+
+  This is fetch plus merge or rebase, not `git pull`, so conflict policy is one
+  code path. The fetch timeout is 120 seconds. `refspec` is optional. When it is
+  missing, the tracking ref `remote/current-branch` is merged or rebased.
+
+  ## Equivalent Bash
+
+      git -C /repo fetch origin
+      git -C /repo merge --no-edit origin/main
+  """
+  @spec pull(
+          remote :: String.t(),
+          refspec :: String.t() | nil,
+          rebase? :: boolean(),
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def pull(remote, refspec, rebase?, fail_on_conflict?, working_directory, node_name, field_name)
+      when is_binary(remote) and is_boolean(rebase?) and is_boolean(fail_on_conflict?) and
+             is_binary(working_directory) do
+    with {:ok, _output} <-
+           fetch_ref(remote, refspec, working_directory, node_name, field_name),
+         {:ok, target} <-
+           pull_target(remote, refspec, working_directory, node_name, field_name) do
+      integrate_pull(target, rebase?, fail_on_conflict?, working_directory, node_name, field_name)
+    end
+  end
+
+  @doc """
+  Pushes to `remote`.
+
+  There is no `--force` and no `--force-with-lease`. `refspec` is optional. When
+  it is missing and `set_upstream?` is false, Git uses the configured upstream
+  and fails if there is none. The timeout is 120 seconds.
+
+  ## Equivalent Bash
+
+      git -C /repo push origin
+      git -C /repo push -u origin feature
+  """
+  @spec push(
+          remote :: String.t(),
+          refspec :: String.t() | nil,
+          set_upstream? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  def push(remote, refspec, set_upstream?, working_directory, node_name, field_name)
+      when is_binary(remote) and is_boolean(set_upstream?) and is_binary(working_directory) do
+    with {:ok, args} <-
+           push_args(remote, refspec, set_upstream?, working_directory, node_name, field_name),
+         {:ok, _output} <-
+           run_command(args, working_directory, node_name, field_name, timeout: @fetch_timeout) do
+      :ok
+    end
   end
 
   @doc """
@@ -376,6 +842,142 @@ defmodule DomovoyGitPlugin.Capabilities do
     with {:ok, output} <-
            run_command(["status", "--porcelain"], working_directory, node_name, field_name) do
       {:ok, status_entries(output)}
+    end
+  end
+
+  @doc """
+  Returns a snapshot of the checkout at `working_directory`.
+
+  That directory may be the main worktree or a linked worktree. `path` is this
+  checkout. `repo_root` is the first record of `git worktree list --porcelain`,
+  which is the main checkout. Domovoy's JSON under the git-common-dir names
+  `base_branch`. Unmanaged worktrees and the main checkout give `nil`.
+
+  Operation detection inspects Git state files through `git rev-parse --git-path`.
+  That is correct inside a worktree. A rebase counts through its state
+  directory. `REBASE_HEAD` alone is a leftover that Git keeps after a completed
+  rebase. When more than one state exists, the order is rebase, then merge,
+  then cherry-pick, then revert.
+
+  A merge that finished resolving but is not committed still has `MERGE_HEAD`.
+  Then `operation` is `:merging` and `conflicts` is `[]`. That pair is data, not
+  an error.
+
+  ## Equivalent Bash
+
+      git -C /repo rev-parse --show-toplevel
+      git -C /repo worktree list --porcelain
+      git -C /repo status --porcelain
+  """
+  @spec repo_state(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, RepoStateType.state()} | failure()
+  def repo_state(working_directory, node_name, field_name) when is_binary(working_directory) do
+    with {:ok, repository} <- repository(working_directory, node_name, field_name),
+         {:ok, records} <- worktree_records(working_directory, node_name, field_name),
+         {:ok, repo_root} <- main_checkout(records, working_directory, node_name, field_name),
+         {:ok, {current_branch, detached?}} <-
+           current_branch_state(working_directory, node_name, field_name),
+         {:ok, upstream_branch} <- upstream_branch(working_directory),
+         {:ok, {ahead, behind}} <- ahead_behind(working_directory, node_name, field_name),
+         {:ok, status} <- status_short(working_directory, node_name, field_name),
+         {:ok, operation} <- operation(working_directory, node_name, field_name),
+         {:ok, conflicts} <-
+           conflicts_from_status(status, working_directory, node_name, field_name) do
+      path = repository.root
+      checkout = if path == repo_root, do: :main, else: :worktree
+      worktree_name = if checkout == :worktree, do: Path.basename(path), else: nil
+
+      {:ok,
+       %{
+         path: path,
+         repo_root: repo_root,
+         checkout: checkout,
+         worktree_name: worktree_name,
+         base_branch: recorded_base_branch(repository.git_common_directory, worktree_name),
+         current_branch: current_branch,
+         detached?: detached?,
+         upstream_branch: upstream_branch,
+         ahead: ahead,
+         behind: behind,
+         dirty?: status != [],
+         operation: operation,
+         status: status,
+         conflicts: conflicts
+       }}
+    end
+  end
+
+  @doc """
+  Returns the in-progress Git operation of the checkout at `working_directory`.
+
+  Detection uses `git rev-parse --git-path` so it is correct inside a worktree.
+  A rebase counts when the `rebase-merge` or the `rebase-apply` directory
+  exists. `REBASE_HEAD` alone does not count, since Git leaves that file behind
+  after a completed rebase. When more than one state exists, the order is
+  rebase, then merge, then cherry-pick, then revert.
+
+  ## Equivalent Bash
+
+      git -C /repo rev-parse --git-path MERGE_HEAD
+  """
+  @spec operation(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, RepoStateType.operation()} | failure()
+  def operation(working_directory, node_name, field_name) when is_binary(working_directory) do
+    args = Enum.flat_map(@operation_probes, fn {path, _operation} -> ["--git-path", path] end)
+
+    with {:ok, output} <-
+           run_command(["rev-parse" | args], working_directory, node_name, field_name) do
+      {:ok, detect_operation(output, working_directory)}
+    end
+  end
+
+  @doc """
+  Returns how far `HEAD` is ahead of and behind its upstream.
+
+  When there is no upstream, both numbers are `nil`. Detached HEAD has no
+  upstream.
+
+  ## Equivalent Bash
+
+      git -C /repo rev-list --left-right --count HEAD...@{u}
+  """
+  @spec ahead_behind(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, {non_neg_integer() | nil, non_neg_integer() | nil}} | failure()
+  def ahead_behind(working_directory, node_name, field_name) when is_binary(working_directory) do
+    with {:ok, upstream} <- upstream_branch(working_directory) do
+      count_ahead_behind(upstream, working_directory, node_name, field_name)
+    end
+  end
+
+  @doc """
+  Returns the unmerged paths of the checkout at `working_directory`.
+
+  Porcelain names the kind. `git ls-files -u` names the stages. Conflict
+  markers in the working-tree file name the hunks. An empty list means there
+  are no unmerged paths. That is success, not an error.
+
+  ## Equivalent Bash
+
+      git -C /repo status --porcelain
+      git -C /repo ls-files -u
+  """
+  @spec conflicts(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, [ConflictsType.conflict()]} | failure()
+  def conflicts(working_directory, node_name, field_name) when is_binary(working_directory) do
+    with {:ok, status} <- status_short(working_directory, node_name, field_name) do
+      conflicts_from_status(status, working_directory, node_name, field_name)
     end
   end
 
@@ -830,19 +1432,326 @@ defmodule DomovoyGitPlugin.Capabilities do
   defp location(false, true), do: :remote
   defp location(false, false), do: :new
 
-  @spec checkout_args(
-          worktree_path :: String.t(),
+  @spec require_local_branch(
+          exists? :: boolean(),
           branch :: String.t(),
-          location :: branch_location()
-        ) :: [String.t()]
-  defp checkout_args(worktree_path, branch, :local),
-    do: ["-C", worktree_path, "checkout", branch]
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp require_local_branch(true, _branch, _node_name, _field_name), do: :ok
 
-  defp checkout_args(worktree_path, branch, :remote),
-    do: ["-C", worktree_path, "checkout", "--track", "origin/#{branch}"]
+  defp require_local_branch(false, branch, node_name, field_name),
+    do: {:error, GitError.branch_not_found(branch, node_name, field_name)}
 
-  defp checkout_args(worktree_path, branch, :new),
-    do: ["-C", worktree_path, "checkout", "-b", branch]
+  @spec require_remote_branch(
+          exists? :: boolean(),
+          remote :: String.t(),
+          branch :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp require_remote_branch(true, _remote, _branch, _node_name, _field_name), do: :ok
+
+  defp require_remote_branch(false, remote, branch, node_name, field_name),
+    do: {:error, GitError.remote_branch_not_found(remote, branch, node_name, field_name)}
+
+  @spec create_branch_args(branch :: String.t(), start_point :: String.t() | nil) :: [String.t()]
+  defp create_branch_args(branch, start_point)
+       when is_binary(start_point) and start_point != "",
+       do: ["checkout", "-b", branch, start_point]
+
+  defp create_branch_args(branch, _start_point), do: ["checkout", "-b", branch]
+
+  @spec main_checkout(
+          records :: [WorktreeMetadata.worktree_record()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, String.t()} | failure()
+  defp main_checkout([], working_directory, node_name, field_name),
+    do: {:error, GitError.repository_not_resolved(working_directory, node_name, field_name)}
+
+  defp main_checkout(records, _working_directory, _node_name, _field_name),
+    do: {:ok, WorktreeMetadata.main_root(records)}
+
+  @spec current_branch_state(
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, {String.t() | nil, boolean()}} | failure()
+  defp current_branch_state(working_directory, node_name, field_name) do
+    with {:ok, output} <-
+           run_command(["branch", "--show-current"], working_directory, node_name, field_name) do
+      case String.trim(output) do
+        "" -> {:ok, {nil, true}}
+        branch -> {:ok, {branch, false}}
+      end
+    end
+  end
+
+  @spec recorded_base_branch(
+          git_common_directory :: String.t(),
+          worktree_name :: String.t() | nil
+        ) ::
+          String.t() | nil
+  defp recorded_base_branch(_git_common_directory, nil), do: nil
+
+  defp recorded_base_branch(git_common_directory, worktree_name),
+    do: WorktreeMetadata.read_base_branch(git_common_directory, worktree_name)
+
+  @spec detect_operation(output :: String.t(), working_directory :: String.t()) ::
+          RepoStateType.operation()
+  defp detect_operation(output, working_directory) do
+    paths = String.split(output, "\n", trim: true)
+
+    @operation_probes
+    |> Enum.zip(paths)
+    |> Enum.find_value(:idle, fn {{_name, operation}, path} ->
+      if path |> Path.expand(working_directory) |> File.exists?(), do: operation
+    end)
+  end
+
+  @spec count_ahead_behind(
+          upstream :: String.t() | nil,
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, {non_neg_integer() | nil, non_neg_integer() | nil}} | failure()
+  defp count_ahead_behind(nil, _working_directory, _node_name, _field_name), do: {:ok, {nil, nil}}
+
+  defp count_ahead_behind(_upstream, working_directory, node_name, field_name) do
+    args = ["rev-list", "--left-right", "--count", "HEAD...@{u}"]
+
+    with {:ok, output} <- run_command(args, working_directory, node_name, field_name) do
+      parse_ahead_behind(output)
+    end
+  end
+
+  @spec parse_ahead_behind(output :: String.t()) ::
+          {:ok, {non_neg_integer() | nil, non_neg_integer() | nil}}
+  defp parse_ahead_behind(output) do
+    case output |> String.trim() |> String.split("\t") do
+      [ahead, behind] ->
+        with {ahead, ""} <- Integer.parse(ahead),
+             {behind, ""} <- Integer.parse(behind),
+             true <- ahead >= 0 and behind >= 0 do
+          {:ok, {ahead, behind}}
+        else
+          _other -> {:ok, {nil, nil}}
+        end
+
+      _other ->
+        {:ok, {nil, nil}}
+    end
+  end
+
+  @spec conflicts_from_status(
+          status :: [StatusEntriesType.entry()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, [ConflictsType.conflict()]} | failure()
+  defp conflicts_from_status(status, working_directory, node_name, field_name) do
+    with {:ok, output} <-
+           run_command(["ls-files", "-u"], working_directory, node_name, field_name) do
+      stages_by_path = Conflict.parse_stages(output)
+
+      conflicts =
+        status
+        |> Enum.filter(&Conflict.unmerged?/1)
+        |> Enum.map(fn entry ->
+          Conflict.conflict(
+            entry,
+            Map.get(stages_by_path, entry.path, Conflict.empty_stages()),
+            working_directory
+          )
+        end)
+
+      {:ok, conflicts}
+    end
+  end
+
+  @spec require_paths(
+          paths :: [String.t()],
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp require_paths([], node_name, field_name),
+    do: {:error, GitError.missing_input(node_name, field_name)}
+
+  defp require_paths(paths, _node_name, _field_name) when is_list(paths), do: :ok
+
+  @spec commit_args(message :: String.t(), allow_empty? :: boolean()) :: [String.t()]
+  defp commit_args(message, true), do: ["commit", "--allow-empty", "-m", message]
+  defp commit_args(message, false), do: ["commit", "-m", message]
+
+  @spec finish_command(
+          args :: [String.t()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp finish_command(args, working_directory, node_name, field_name) do
+    with {:ok, _output} <- run_command(args, working_directory, node_name, field_name) do
+      :ok
+    end
+  end
+
+  @spec integrate(
+          args :: [String.t()],
+          fail_on_conflict? :: boolean(),
+          operations :: [RepoStateType.operation()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name(),
+          opts :: keyword()
+        ) :: :ok | failure()
+  defp integrate(
+         args,
+         fail_on_conflict?,
+         operations,
+         working_directory,
+         node_name,
+         field_name,
+         opts \\ []
+       ) do
+    case run_command(args, working_directory, node_name, field_name, opts) do
+      {:ok, _output} ->
+        :ok
+
+      {:error, error} ->
+        accept_conflicted_stop(
+          error,
+          fail_on_conflict?,
+          operations,
+          working_directory,
+          node_name,
+          field_name
+        )
+    end
+  end
+
+  @spec accept_conflicted_stop(
+          error :: Error.t(),
+          fail_on_conflict? :: boolean(),
+          operations :: [RepoStateType.operation()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp accept_conflicted_stop(
+         error,
+         true,
+         _operations,
+         _working_directory,
+         _node_name,
+         _field_name
+       ),
+       do: {:error, error}
+
+  defp accept_conflicted_stop(error, false, operations, working_directory, node_name, field_name) do
+    case operation(working_directory, node_name, field_name) do
+      {:ok, operation} ->
+        if operation in operations, do: :ok, else: {:error, error}
+
+      {:error, _reason} ->
+        {:error, error}
+    end
+  end
+
+  @spec checkout_stage(
+          stage :: String.t(),
+          paths :: [String.t()],
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp checkout_stage(stage, paths, working_directory, node_name, field_name) do
+    with :ok <- require_paths(paths, node_name, field_name),
+         {:ok, _output} <-
+           run_command(
+             ["checkout", stage, "--" | paths],
+             working_directory,
+             node_name,
+             field_name
+           ) do
+      :ok
+    end
+  end
+
+  @spec fetch_ref(
+          remote :: String.t(),
+          refspec :: String.t() | nil,
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: command_output_result()
+  defp fetch_ref(remote, refspec, working_directory, node_name, field_name)
+       when is_binary(refspec) and refspec != "" do
+    run_command(["fetch", remote, refspec], working_directory, node_name, field_name,
+      timeout: @fetch_timeout
+    )
+  end
+
+  defp fetch_ref(remote, _refspec, working_directory, node_name, field_name) do
+    fetch(remote, working_directory, node_name, field_name)
+  end
+
+  @spec pull_target(
+          remote :: String.t(),
+          refspec :: String.t() | nil,
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, String.t()} | failure()
+  defp pull_target(_remote, refspec, _working_directory, _node_name, _field_name)
+       when is_binary(refspec) and refspec != "",
+       do: {:ok, "FETCH_HEAD"}
+
+  defp pull_target(remote, _refspec, working_directory, node_name, field_name) do
+    with {:ok, branch} <- current_branch(working_directory, node_name, field_name) do
+      {:ok, "#{remote}/#{branch}"}
+    end
+  end
+
+  @spec integrate_pull(
+          target :: String.t(),
+          rebase? :: boolean(),
+          fail_on_conflict? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: :ok | failure()
+  defp integrate_pull(target, true, fail_on_conflict?, working_directory, node_name, field_name),
+    do: rebase(target, fail_on_conflict?, working_directory, node_name, field_name)
+
+  defp integrate_pull(target, false, fail_on_conflict?, working_directory, node_name, field_name),
+    do: merge(target, fail_on_conflict?, working_directory, node_name, field_name)
+
+  @spec push_args(
+          remote :: String.t(),
+          refspec :: String.t() | nil,
+          set_upstream? :: boolean(),
+          working_directory :: String.t(),
+          node_name :: Node.name(),
+          field_name :: GitError.field_name()
+        ) :: {:ok, [String.t()]} | failure()
+  defp push_args(remote, refspec, true, _working_directory, _node_name, _field_name)
+       when is_binary(refspec) and refspec != "",
+       do: {:ok, ["push", "-u", remote, refspec]}
+
+  defp push_args(remote, refspec, false, _working_directory, _node_name, _field_name)
+       when is_binary(refspec) and refspec != "",
+       do: {:ok, ["push", remote, refspec]}
+
+  defp push_args(remote, _refspec, true, working_directory, node_name, field_name) do
+    with {:ok, branch} <- current_branch(working_directory, node_name, field_name) do
+      {:ok, ["push", "-u", remote, branch]}
+    end
+  end
+
+  defp push_args(remote, _refspec, false, _working_directory, _node_name, _field_name),
+    do: {:ok, ["push", remote]}
 
   @spec worktree_add_args(
           path :: String.t(),
